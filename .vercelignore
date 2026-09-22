@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+.venv
+node_modules
+.next
+ops.db
+ops.db-shm
+ops.db-wal
+.git
