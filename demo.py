@@ -1,35 +1,20 @@
-"""End-to-end demo: seeds realistic events, runs the worker, prints the
-transcript of every agent decision. Run: python3 demo.py
-"""
-import os, random, tempfile, threading, time
-
-os.environ.setdefault("MOCK_LLM", "1")  # unset + REQUESTY_API_KEY for real LLM
-os.environ["DB_PATH"] = tempfile.mktemp(suffix=".db")
-os.environ["BACKOFF_BASE"] = "0.3"
-
-import engine
-
-random.seed(3)
-
-EVENTS = [
-    "Water is pouring out from under the bathroom sink, please hurry",
-    "We checked in and the towels are dirty, also trash was left",
-    "What's the wifi password?",
-    "hey so uh quick question about the place",
-    "The AC is broken and there's a baby in the unit",
-]
-
-stop = threading.Event()
-t = threading.Thread(target=engine.worker, args=(stop,), kwargs={"interval": 0.1}, daemon=True)
-t.start()
-
-for e in EVENTS:
-    engine.create_incident(e)
-time.sleep(4)
-stop.set()
-
-snap = engine.snapshot()
-for inc in reversed(snap["incidents"]):
-    print(f"\n=== #{inc['id']} [{inc['state']}] {inc['message'][:60]}")
-    for ev in reversed([e for e in snap["events"] if e["incident_id"] == inc["id"]]):
-        print(f"  {ev['kind']:>18} | {ev['detail'][:100]}")
+"""Offline walkthrough with isolated, automatically removed storage."""
+import os
+import tempfile
+os.environ["MOCK_LLM"] = "1"
+os.environ["BACKOFF_BASE"] = "0"
+with tempfile.TemporaryDirectory() as directory:
+    os.environ["DB_PATH"] = f"{directory}/demo.db"
+    import engine
+    engine.init()
+    for message in ["Unit 4B sink leaking", "Unit 8 towels are dirty", "What is the wifi password?", "Gas smell in unit 5"]:
+        engine.create_incident(message)
+    for _ in range(10):
+        if not engine.process_pending():
+            break
+    state = engine.snapshot()
+    for incident in reversed(state["incidents"]):
+        print(f"{incident['state']}: {incident['message']}")
+        for event in reversed(state["events"]):
+            if event["incident_id"] == incident["id"]:
+                print(f"  {event['kind']}: {event['detail']}")

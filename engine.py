@@ -1,210 +1,265 @@
-"""Ops engine: incident state machine driven by agents, with retries,
-idempotent dispatch, and human escalation.
+"""Durable single-host queue; LangGraph decisions; fenced commits; bounded workers."""
+import json
+import os
+import random
+import sqlite3
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from typing import TypedDict
 
-State flow:
-  NEW -> TRIAGED -> DISPATCHED -> VERIFYING -> RESOLVED
-                     |    ^           |
-                     +----+  (bad evidence, re-dispatch, max 2)
-                     +--> ESCALATED (uncertain triage / retries exhausted)
-  ESCALATED --human--> RESOLVED | TRIAGED
-"""
-import json, os, random, sqlite3, threading, time, uuid
-
+from langgraph.graph import END, START, StateGraph
 import agents
 
 DB = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "ops.db"))
 MAX_ATTEMPTS = 3
 MAX_REDISPATCH = 2
-BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "2"))  # evals set this to 0
-
+BACKOFF_BASE = float(os.getenv("BACKOFF_BASE", "2"))
+CONCURRENCY = min(8, max(1, int(os.getenv("WORKER_CONCURRENCY", "4"))))
+LEASE_SECONDS = 120
+Retryable = agents.Retryable
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS incidents(
-  id TEXT PRIMARY KEY, state TEXT NOT NULL, category TEXT, severity TEXT,
-  message TEXT NOT NULL, vendor_id TEXT, attempts INTEGER DEFAULT 0,
-  next_run REAL DEFAULT 0, created REAL, updated REAL);
+ id TEXT PRIMARY KEY, state TEXT NOT NULL, category TEXT, severity TEXT,
+ message TEXT NOT NULL, vendor_id TEXT, attempts INTEGER DEFAULT 0,
+ next_run REAL DEFAULT 0, created REAL, updated REAL);
 CREATE TABLE IF NOT EXISTS events(
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  incident_id TEXT, kind TEXT, detail TEXT, ts REAL);
-CREATE TABLE IF NOT EXISTS vendors(
-  id TEXT PRIMARY KEY, name TEXT, trade TEXT);
+ id INTEGER PRIMARY KEY AUTOINCREMENT, incident_id TEXT, kind TEXT, detail TEXT, ts REAL);
+CREATE TABLE IF NOT EXISTS vendors(id TEXT PRIMARY KEY, name TEXT, trade TEXT);
+CREATE TABLE IF NOT EXISTS submissions(key TEXT PRIMARY KEY, incident_id TEXT, message TEXT, source TEXT);
+CREATE TABLE IF NOT EXISTS jobs(key TEXT PRIMARY KEY, incident_id TEXT, vendor_id TEXT, created REAL);
+CREATE TABLE IF NOT EXISTS health(id INTEGER PRIMARY KEY CHECK(id=1), heartbeat REAL, error TEXT);
+CREATE INDEX IF NOT EXISTS pending ON incidents(state,next_run);
+CREATE INDEX IF NOT EXISTS incident_trace ON events(incident_id,id);
 """
 
-_lock = threading.Lock()
 
-
+@contextmanager
 def conn():
-    c = sqlite3.connect(DB)
+    c = sqlite3.connect(DB, timeout=5)
     c.row_factory = sqlite3.Row
-    return c
+    try:
+        with c:
+            yield c
+    finally:
+        c.close()
 
 
 def init():
-    with _lock, conn() as c:
+    with conn() as c:
+        c.execute("PRAGMA journal_mode=WAL")
         c.executescript(SCHEMA)
-        if not c.execute("SELECT 1 FROM vendors").fetchone():
-            c.executemany("INSERT INTO vendors VALUES(?,?,?)", [
-                ("v-rapid", "RapidRooter", "plumbing"),
-                ("v-spark", "SparkClean", "cleaning"),
-                ("v-hal", "HandyHal", "general"),
-            ])
+        c.execute("BEGIN IMMEDIATE")
+        columns = {r[1] for r in c.execute("PRAGMA table_info(incidents)")}
+        for name, definition in {"retry_count": "INTEGER DEFAULT 0", "lease_until": "REAL DEFAULT 0",
+                                 "lease_token": "TEXT", "review_reason": "TEXT"}.items():
+            if name not in columns:
+                c.execute(f"ALTER TABLE incidents ADD COLUMN {name} {definition}")
+        c.executemany("INSERT OR IGNORE INTO vendors VALUES(?,?,?)", [
+            ("v-rapid", "RapidRooter", "plumbing"), ("v-spark", "SparkClean", "cleaning"),
+            ("v-hal", "HandyHal", "general")])
 
 
-def log(c, incident_id, kind, detail):
+def log(c, iid, kind, detail):
     c.execute("INSERT INTO events(incident_id,kind,detail,ts) VALUES(?,?,?,?)",
-              (incident_id, kind,
-               detail if isinstance(detail, str) else json.dumps(detail), time.time()))
+              (iid, kind, detail if isinstance(detail, str) else json.dumps(detail), time.time()))
 
 
-def create_incident(message: str, source: str = "guest") -> str:
-    iid = uuid.uuid4().hex[:8]
-    with _lock, conn() as c:
-        c.execute("INSERT INTO incidents VALUES(?,?,?,?,?,?,0,0,?,?)",
-                  (iid, "NEW", None, None, message, None, time.time(), time.time()))
+def create_incident(message, source="guest", key=None):
+    message = message.strip()
+    if not message or len(message) > 4000 or len(source) > 40:
+        raise ValueError("A message of 1–4000 characters is required")
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        if key:
+            previous = c.execute("SELECT * FROM submissions WHERE key=?", (key,)).fetchone()
+            if previous:
+                if (message, source) != (previous["message"], previous["source"]):
+                    raise ValueError("Request key was already used for a different event")
+                return previous["incident_id"]
+        if c.execute("SELECT count(*) FROM incidents WHERE state IN ('NEW','TRIAGED','DISPATCHED')").fetchone()[0] >= 1000:
+            raise OverflowError("Queue at capacity; try again later")
+        iid = uuid.uuid4().hex
+        c.execute("INSERT INTO incidents(id,state,message,created,updated) VALUES(?,?,?,?,?)",
+                  (iid, "NEW", message, time.time(), time.time()))
+        if key:
+            c.execute("INSERT INTO submissions VALUES(?,?,?,?)", (key, iid, message, source))
         log(c, iid, "created", {"source": source, "message": message})
-    return iid
+        return iid
 
 
-class Retryable(Exception):
-    """Step failed transiently; worker retries with backoff."""
+def _send_job(incident, vendor_id, key):
+    # ponytail: persistent simulated receiver. Real receivers must honor this same key.
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        c.execute("INSERT OR IGNORE INTO jobs VALUES(?,?,?,?)", (key, incident["id"], vendor_id, time.time()))
+        job = c.execute("SELECT * FROM jobs WHERE key=?", (key,)).fetchone()
+        if job["vendor_id"] != vendor_id:
+            raise ValueError("Job key cannot change vendor")
+        return dict(job_id=key, accepted_by=vendor_id, simulated=True)
 
 
-
-def _send_job(incident: dict, vendor_id: str, idempotency_key: str) -> dict:
-    """Simulated vendor webhook. Idempotency key means a retry after a timeout
-    can't double-book the job — vendor side dedupes on this key."""
-    # ponytail: random 30% reject to exercise the retry path in demos; real impl
-    # is an HTTP POST with the same key in a header.
-    if random.random() < 0.30:
-        raise Retryable(f"vendor {vendor_id} rejected/timed out")
-    return {"job_id": idempotency_key, "accepted_by": vendor_id}
+def _collect_evidence(incident):
+    return f"SIMULATED completion for {incident['id']}: {incident['message']}. Repair and matching checklist recorded."
 
 
-def _collect_evidence(vendor_id: str) -> str:
-    # ponytail: simulated vendor completion; real impl = webhook callback.
-    return random.choice([
-        "Replaced the P-trap, ran water for 10 min, tested dry. Photo attached.",
-        "done",
-        "Deep clean finished, linens replaced, checklist signed. Photo attached.",
-        "looked at it",
-    ])
+class Flow(TypedDict):
+    incident: dict
+    outcome: dict
 
 
-def _escalate(c, inc, reason):
-    c.execute("UPDATE incidents SET state='ESCALATED', updated=? WHERE id=?",
-              (time.time(), inc["id"]))
-    log(c, inc["id"], "escalated", reason)
+def _triage(state):
+    inc = state["incident"]
+    d = agents.Triage.model_validate(agents.triage(inc["message"])).model_dump()
+    reason = "Emergency: operator must assess before dispatch" if d["severity"] == "critical" else (
+        "More information is needed" if d["confidence"] < 0.6 else None)
+    return {"outcome": dict(state="ESCALATED" if reason else "TRIAGED", category=d["category"],
+                            severity=d["severity"], review_reason=reason, events=[("triage", d)])}
 
 
-def step(inc) -> None:
-    """Run one state transition. Raises Retryable for transient failures."""
-    with _lock, conn() as c:
-        inc = dict(inc)
-        iid = inc["id"]
-
-        if inc["state"] == "NEW":
-            d = agents.triage(inc["message"])
-            log(c, iid, "triage", d)
-            if d["confidence"] < 0.6:
-                _escalate(c, inc, {"reason": "triage_uncertain", **d})
-                return
-            c.execute("UPDATE incidents SET state='TRIAGED',category=?,severity=?,updated=? WHERE id=?",
-                      (d["category"], d["severity"], time.time(), iid))
-
-        elif inc["state"] == "TRIAGED":
-            vendors = [dict(r) for r in c.execute("SELECT * FROM vendors")]
-            d = agents.dispatch(inc, vendors)
-            log(c, iid, "dispatch_decision", d)
-            attempts = inc["attempts"] + 1
-            # Idempotency key: same incident + attempt => same key, safe to retry.
-            key = f"{iid}:dispatch:{attempts}"
-            job = _send_job(inc, d["vendor_id"], key)
-            log(c, iid, "dispatched", job)
-            c.execute("UPDATE incidents SET state='DISPATCHED',vendor_id=?,attempts=?,updated=? WHERE id=?",
-                      (d["vendor_id"], attempts, time.time(), iid))
-
-        elif inc["state"] == "DISPATCHED":
-            evidence = _collect_evidence(inc["vendor_id"])
-            log(c, iid, "evidence", evidence)
-            d = agents.verify(inc, evidence)
-            log(c, iid, "verify", d)
-            if d["complete"] and d["confidence"] >= 0.6:
-                reply = agents.guest_reply(inc, "resolved")
-                log(c, iid, "guest_reply", reply)
-                c.execute("UPDATE incidents SET state='RESOLVED',updated=? WHERE id=?",
-                          (time.time(), iid))
-            elif inc["attempts"] < MAX_REDISPATCH:
-                log(c, iid, "redispatch", {"why": d["reasoning"]})
-                c.execute("UPDATE incidents SET state='TRIAGED',updated=? WHERE id=?",
-                          (time.time(), iid))
-            else:
-                _escalate(c, inc, {"reason": "verify_failed", **d})
+def _dispatch(state):
+    inc = state["incident"]
+    if inc["severity"] == "critical":
+        return {"outcome": dict(state="ESCALATED", review_reason="Emergency requires operator handling", events=[])}
+    with conn() as c:
+        vendors = [dict(r) for r in c.execute("SELECT * FROM vendors")]
+    d = agents.dispatch(inc, vendors)
+    if d["confidence"] < 0.6 or d["vendor_id"] not in {v["id"] for v in vendors}:
+        return {"outcome": dict(state="ESCALATED", review_reason=d["reasoning"], events=[("dispatch_decision", d)])}
+    # attempts counts logical bookings, retry_count counts network retries.
+    key = f"{inc['id']}:dispatch:{inc['attempts'] + 1}"
+    job = _send_job(inc, d["vendor_id"], key)
+    return {"outcome": dict(state="DISPATCHED", vendor_id=d["vendor_id"], attempts=inc["attempts"] + 1,
+                            events=[("dispatch_decision", d), ("dispatched", job)])}
 
 
-def process_pending() -> int:
-    """One worker sweep. Returns how many incidents were acted on."""
-    now = time.time()
-    with _lock, conn() as c:
-        rows = c.execute(
-            "SELECT * FROM incidents WHERE state IN ('NEW','TRIAGED','DISPATCHED') AND next_run<=?",
-            (now,)).fetchall()
-    acted = 0
-    for row in rows:
-        try:
-            step(row)
-            acted += 1
-        except Retryable as e:
-            with _lock, conn() as c:
-                attempts = row["attempts"] + 1
-                if attempts >= MAX_ATTEMPTS:
-                    log(c, row["id"], "retry_exhausted", str(e))
-                    _escalate(c, dict(row), {"reason": "retries_exhausted", "error": str(e)})
-                else:
-                    backoff = min(30, BACKOFF_BASE ** attempts) + random.random() * BACKOFF_BASE
-                    log(c, row["id"], "retry", {"error": str(e), "attempt": attempts,
-                                                 "backoff_s": round(backoff, 2)})
-                    c.execute("UPDATE incidents SET attempts=?,next_run=?,updated=? WHERE id=?",
-                              (attempts, now + backoff, time.time(), row["id"]))
-        except Exception as e:  # agent/infra blew up — don't kill the worker
-            with _lock, conn() as c:
-                _escalate(c, dict(row), {"reason": "step_error", "error": str(e)})
-    return acted
+def _verify(state):
+    inc = state["incident"]
+    evidence = _collect_evidence(inc)
+    d = agents.Verification.model_validate(agents.verify(inc, evidence)).model_dump()
+    events = [("evidence", evidence), ("verify", d)]
+    if d["complete"] and d["confidence"] >= 0.6:
+        events.append(("guest_reply_draft", agents.guest_reply(inc, "resolved")))
+        return {"outcome": dict(state="RESOLVED", events=events)}
+    if inc["attempts"] < MAX_REDISPATCH:
+        return {"outcome": dict(state="TRIAGED", events=events + [("redispatch", d["reasoning"])])}
+    return {"outcome": dict(state="ESCALATED", review_reason="Evidence did not establish resolution", events=events)}
 
 
-def human_action(incident_id: str, action: str, note: str = "") -> bool:
-    """Human-in-the-loop: approve-close an escalation, or send it back out."""
-    with _lock, conn() as c:
-        row = c.execute("SELECT * FROM incidents WHERE id=? AND state='ESCALATED'",
-                        (incident_id,)).fetchone()
-        if not row:
-            return False
-        if action == "close":
-            new = "RESOLVED"
-        elif action == "redispatch":
-            new = "TRIAGED"
+# Each invocation executes one decision; SQL persists the resulting transition and trace atomically.
+# No second checkpoint store. Retry timing and human waits live in the durable queue.
+_graph = StateGraph(Flow)
+for name, node in [("triage", _triage), ("dispatch", _dispatch), ("verify", _verify)]:
+    _graph.add_node(name, node)
+    _graph.add_edge(name, END)
+_graph.add_conditional_edges(START, lambda s: {"NEW": "triage", "TRIAGED": "dispatch", "DISPATCHED": "verify"}[s["incident"]["state"]])
+workflow = _graph.compile()
+
+
+def _claim(iid):
+    now, token = time.time(), uuid.uuid4().hex
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        changed = c.execute("UPDATE incidents SET lease_until=?,lease_token=? WHERE id=? "
+                            "AND state IN ('NEW','TRIAGED','DISPATCHED') AND next_run<=? AND lease_until<=?",
+                            (now + LEASE_SECONDS, token, iid, now, now)).rowcount
+        if not changed:
+            return None
+        return dict(c.execute("SELECT * FROM incidents WHERE id=?", (iid,)).fetchone())
+
+
+def step(row):
+    inc = _claim(row["id"])
+    if not inc:
+        return False
+    started = time.perf_counter()
+    try:
+        outcome = workflow.invoke({"incident": inc})["outcome"]
+        outcome.update(retry_count=0, next_run=0)
+    except Retryable as error:
+        count = inc["retry_count"] + 1
+        if count >= MAX_ATTEMPTS:
+            outcome = dict(state="ESCALATED", retry_count=count, review_reason="Transient failures exhausted the retry budget",
+                           events=[("retry_exhausted", type(error).__name__)])
         else:
-            return False
-        c.execute("UPDATE incidents SET state=?,attempts=0,next_run=0,updated=? WHERE id=?",
-                  (new, time.time(), incident_id))
-        log(c, incident_id, f"human_{action}", note)
+            delay = min(30, BACKOFF_BASE * 2 ** (count - 1)) * random.uniform(0.5, 1)
+            delay = max(delay, error.retry_after)
+            outcome = dict(retry_count=count, next_run=time.time() + delay,
+                           events=[("retry", {"attempt": count, "delay_s": round(delay, 3)})])
+    except Exception as error:
+        outcome = dict(state="ESCALATED", review_reason=f"Decision failed validation or execution ({type(error).__name__})",
+                       events=[("step_error", type(error).__name__)])
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        current = c.execute("SELECT lease_token FROM incidents WHERE id=?", (inc["id"],)).fetchone()
+        if current["lease_token"] != inc["lease_token"]:
+            return False  # Expired worker cannot overwrite a newer claim.
+        events = outcome.pop("events")
+        outcome.update(lease_until=0, lease_token=None, updated=time.time())
+        fields = ",".join(f"{field}=?" for field in outcome)
+        c.execute(f"UPDATE incidents SET {fields} WHERE id=?", (*outcome.values(), inc["id"]))
+        for kind, detail in events:
+            log(c, inc["id"], kind, detail)
+        if outcome.get("state") == "ESCALATED":
+            log(c, inc["id"], "escalated", outcome["review_reason"])
+        log(c, inc["id"], "step_timing", {"from": inc["state"], "ms": round((time.perf_counter()-started)*1000, 1)})
     return True
 
 
-def worker(stop: threading.Event, interval: float = 0.5):
-    # ponytail: single worker thread — fine at apartment-portfolio volume.
-    # Upgrade path: SQS/Postgres SKIP LOCKED when one worker isn't enough.
-    init()
+def process_pending():
+    with conn() as c:
+        rows = c.execute("SELECT id FROM incidents WHERE state IN ('NEW','TRIAGED','DISPATCHED') "
+                         "AND next_run<=? AND lease_until<=? ORDER BY created LIMIT ?",
+                         (time.time(), time.time(), CONCURRENCY)).fetchall()
+    # ponytail: independent incidents run concurrently on one host; no network calls inside DB transactions.
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        return sum(pool.map(step, rows))
+
+
+def human_action(iid, action, note="", actor="local-operator"):
+    if action not in ("close", "redispatch") or not note.strip():
+        raise ValueError("Choose a valid action and give a review note")
+    with conn() as c:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT * FROM incidents WHERE id=? AND state='ESCALATED'", (iid,)).fetchone()
+        if not row:
+            return False
+        if action == "redispatch" and (row["severity"] == "critical" or row["category"] == "guest_support" or not row["category"]):
+            raise ValueError("This request requires operator handling; automatic dispatch is unavailable")
+        new = "RESOLVED" if action == "close" else "TRIAGED"
+        # Preserve booking generation so a human-authorized new dispatch receives a new key.
+        c.execute("UPDATE incidents SET state=?,retry_count=0,next_run=0,review_reason=NULL,updated=? WHERE id=?", (new, time.time(), iid))
+        log(c, iid, f"human_{action}", {"note": note.strip(), "actor": actor})
+        return True
+
+
+def worker(stop: threading.Event, interval=0.5):
     while not stop.is_set():
-        process_pending()
+        error = None
+        try:
+            process_pending()
+        except Exception as exc:
+            error = type(exc).__name__
+        try:
+            with conn() as c:
+                c.execute("INSERT OR REPLACE INTO health VALUES(1,?,?)", (time.time(), error))
+        except sqlite3.Error:
+            pass  # Next successful sweep restores health; stale heartbeat reports failure.
         stop.wait(interval)
 
 
-def snapshot() -> dict:
-    with _lock, conn() as c:
-        return {
-            "incidents": [dict(r) for r in c.execute(
-                "SELECT * FROM incidents ORDER BY created DESC LIMIT 50")],
-            "events": [dict(r) for r in c.execute(
-                "SELECT * FROM events ORDER BY id DESC LIMIT 100")],
-            "vendors": [dict(r) for r in c.execute("SELECT * FROM vendors")],
-        }
-
+def snapshot():
+    with conn() as c:
+        health = c.execute("SELECT * FROM health WHERE id=1").fetchone()
+        counts = {r[0]: r[1] for r in c.execute("SELECT state,count(*) FROM incidents GROUP BY state")}
+        return dict(
+            incidents=[dict(r) for r in c.execute("SELECT * FROM incidents ORDER BY created DESC LIMIT 100")],
+            events=[dict(r) for r in c.execute("SELECT * FROM events ORDER BY id DESC LIMIT 100")],
+            vendors=[dict(r) for r in c.execute("SELECT * FROM vendors")],
+            counts=counts,
+            checks=c.execute("SELECT count(*) FROM events WHERE kind='verify'").fetchone()[0],
+            system=dict(mode="demo" if agents.MOCK else "live-model", vendor_mode="simulated",
+                        model=None if agents.MOCK else agents.MODEL, concurrency=CONCURRENCY,
+                        worker_online=bool(health and not health["error"] and time.time()-health["heartbeat"] < 45)))

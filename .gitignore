@@ -1,3 +1,10 @@
 .venv/
 ops.db
 __pycache__/
+node_modules/
+.next/
+.env
+.env.*
+!.env.example
+*.db-wal
+*.db-shm
