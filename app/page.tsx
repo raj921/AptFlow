@@ -51,6 +51,7 @@ type Snapshot = {
     model: string | null;
     concurrency: number;
     worker_online: boolean;
+    request_driven?: boolean;
   };
 };
 const tabs = [
@@ -389,7 +390,9 @@ export default function OperationsPage() {
               {error
                 ? "Connection interrupted"
                 : data
-                  ? `${data.system.concurrency} parallel slots`
+                  ? data.system.request_driven
+                    ? "Request-driven processing"
+                    : `${data.system.concurrency} parallel slots`
                   : "Connecting…"}
             </small>
           </div>

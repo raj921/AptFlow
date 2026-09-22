@@ -114,6 +114,21 @@ checks are recorded above, with their remaining visual and pointer limitations.
 
 ## What production still needs
 
+### Public hosting status
+
+The full pilot is now reachable at [hyatus-ops.vercel.app](https://hyatus-ops.vercel.app),
+with the FastAPI function behind it at [hyatus-ops-backend.vercel.app](https://hyatus-ops-backend.vercel.app).
+The hosted path was exercised with a synthetic maintenance request: the public
+API returned an incident ID, DeepSeek classified it as medium maintenance,
+RapidRooter was selected, and later public state reads advanced it to RESOLVED.
+The hosted runtime reports request-driven processing because Vercel functions
+cannot keep the local background worker alive between invocations.
+
+This deployment is a public pilot, not a production data plane. Its SQLite
+database lives in the serverless instance's ephemeral filesystem and can reset
+when the instance is replaced; a durable queue, managed Postgres, backups and
+an always-on worker are still required for real apartment operations.
+
 1. **Real-world integrations and evidence.** Replace the simulated vendor receiver
    and immediate simulated completion with signed callbacks tied to job and vendor.
    Add a transactional outbound delivery record and an idempotent external sender.

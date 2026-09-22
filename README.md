@@ -56,6 +56,27 @@ It also exercises LangChain's structured output and 429/503/401 behavior with
 an HTTP fixture and drains 100 synthetic requests through four worker slots.
 These checks do **not** establish live-model quality or distributed-service capacity.
 
+## Public hosted pilot
+
+The current public pilot is split into two Vercel projects:
+
+- UI: [hyatus-ops.vercel.app](https://hyatus-ops.vercel.app)
+- FastAPI service: [hyatus-ops-backend.vercel.app](https://hyatus-ops-backend.vercel.app)
+
+The Next.js route handler keeps the operator credential server-side and proxies
+the browser's `/api/*` calls to the FastAPI service. The backend runs as a
+Vercel Python function with the official DeepSeek API in live mode. Because a
+serverless function cannot keep a background thread or local SQLite file
+durably between instances, hosted requests advance the bounded queue while
+serving API calls and use an ephemeral `/tmp/ops.db`. This is suitable for a
+reviewable public pilot; it is not a durable production data store. Move the
+queue to managed Postgres and run a durable worker before real apartment
+operations depend on it.
+
+The `Dockerfile` and `start.sh` keep a single-host deployment option available
+for a VM or container service where the worker and SQLite file can live on the
+same host.
+
 ## Official DeepSeek API / V4.1 Flash
 
 DeepSeek's official API identifies `deepseek-flash` as DeepSeek-V4.1-Flash and

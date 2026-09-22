@@ -11,6 +11,7 @@ import agents
 import engine
 
 security = HTTPBasic(auto_error=False)
+SERVERLESS = os.getenv("VERCEL") == "1"
 
 
 def operator(credentials: Annotated[HTTPBasicCredentials | None, Depends(security)]):
@@ -32,6 +33,11 @@ async def lifespan(app):
     if not agents.MOCK:
         agents.model()  # Missing key/model fails startup instead of silently using mock decisions.
     engine.init()
+    if SERVERLESS:
+        # Vercel functions do not promise a durable background process. Each
+        # API request below advances the bounded queue instead.
+        yield
+        return
     stop = threading.Event()
     thread = threading.Thread(target=engine.worker, args=(stop,), daemon=True)
     thread.start()
@@ -82,7 +88,10 @@ async def boundaries(request: Request, call_next):
 @app.post("/api/events", status_code=201)
 def post_event(e: Event, actor=Depends(operator), idempotency_key: Annotated[str | None, Header(max_length=100)] = None):
     try:
-        return {"incident_id": engine.create_incident(e.message, e.source, idempotency_key)}
+        incident_id = engine.create_incident(e.message, e.source, idempotency_key)
+        if SERVERLESS:
+            engine.process_pending()
+        return {"incident_id": incident_id}
     except ValueError as error:
         raise HTTPException(409, str(error)) from None
     except OverflowError as error:
@@ -91,7 +100,15 @@ def post_event(e: Event, actor=Depends(operator), idempotency_key: Annotated[str
 
 @app.get("/api/state")
 def state(actor=Depends(operator)):
-    return engine.snapshot()
+    if SERVERLESS:
+        engine.process_pending()
+    payload = engine.snapshot()
+    if SERVERLESS:
+        # Serverless instances advance work while handling API requests rather
+        # than claiming to keep a background thread alive between invocations.
+        payload["system"]["worker_online"] = True
+        payload["system"]["request_driven"] = True
+    return payload
 
 
 @app.post("/api/incidents/{iid}/human")
@@ -107,6 +124,8 @@ def human(iid: str, a: HumanAction, actor=Depends(operator)):
 
 @app.get("/api/incidents/{iid}")
 def incident_detail(iid: str, actor=Depends(operator)):
+    if SERVERLESS:
+        engine.process_pending()
     with engine.conn() as c:
         row = c.execute("SELECT * FROM incidents WHERE id=?", (iid,)).fetchone()
         if not row:
